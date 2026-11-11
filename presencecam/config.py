@@ -27,6 +27,8 @@ class Config:
     camera_name: str = "PresenceCam"
     # The real camera, by the name the system shows; empty = the first one.
     input_device: str = ""
+    # Hold the real camera exclusively, so meeting apps can only pick the virtual one (Windows).
+    lock_input: bool = True
     width: int = 1280
     height: int = 720
     fps: int = 30
@@ -37,6 +39,8 @@ class Config:
             raise ValueError("Nazwa kamery: 1-48 znaków, tylko litery, cyfry, spacje i . ( ) - _")
         if not (160 <= self.width <= 3840 and 120 <= self.height <= 2160 and 5 <= self.fps <= 60):
             raise ValueError("Rozdzielczość albo liczba klatek poza zakresem")
+        if not isinstance(self.lock_input, bool):
+            raise ValueError("lock_input musi być true albo false")
         return self
 
     def clips_path(self, base: Path | None = None) -> Path:

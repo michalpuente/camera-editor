@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import threading
 
+import cv2
 import numpy as np
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QImage, QKeySequence, QPixmap, QShortcut
@@ -12,6 +13,7 @@ from PySide6.QtMultimedia import QCamera, QMediaCaptureSession, QMediaDevices, Q
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
+    QCheckBox,
     QComboBox,
     QGridLayout,
     QGroupBox,
@@ -43,8 +45,13 @@ GLITCHES = (
 )
 
 
+def real_cameras(names: list[str], exclude: str) -> list[str]:
+    blocked = (*VIRTUAL_INPUTS, exclude.lower())
+    return [name for name in names if not name.lower().startswith(blocked)]
+
+
 class CameraInput:
-    """Latest frame of the real camera, captured by Qt (names devices like the OS does)."""
+    """Latest frame of the real camera, captured by Qt (shared: other apps can open it too)."""
 
     def __init__(self) -> None:
         self.session = QMediaCaptureSession()
@@ -54,24 +61,25 @@ class CameraInput:
         self.camera: QCamera | None = None
         self.latest: np.ndarray | None = None
 
-    @staticmethod
-    def devices(exclude: str) -> list:
-        blocked = (*VIRTUAL_INPUTS, exclude.lower())
-        return [device for device in QMediaDevices.videoInputs() if not device.description().lower().startswith(blocked)]
+    def devices(self, exclude: str) -> list[str]:
+        return real_cameras([device.description() for device in QMediaDevices.videoInputs()], exclude)
 
     def open(self, name: str, exclude: str) -> str | None:
-        if self.camera is not None:
-            self.camera.stop()
-        self.latest = None
-        devices = self.devices(exclude)
+        self.close()
+        devices = [device for device in QMediaDevices.videoInputs() if device.description() in self.devices(exclude)]
         device = next((item for item in devices if item.description() == name), devices[0] if devices else None)
         if device is None:
-            self.camera = None
             return None
         self.camera = QCamera(device)
         self.session.setCamera(self.camera)
         self.camera.start()
         return device.description()
+
+    def close(self) -> None:
+        if self.camera is not None:
+            self.camera.stop()
+        self.camera = None
+        self.latest = None
 
     def _on_frame(self, frame: QVideoFrame) -> None:
         image = frame.toImage().convertToFormat(QImage.Format.Format_BGR888)
@@ -82,12 +90,71 @@ class CameraInput:
         self.latest = data.reshape(height, image.bytesPerLine())[:, : width * 3].reshape(height, width, 3).copy()
 
 
+class LockedCameraInput:
+    """The real camera held through DirectShow (Windows), which opens it exclusively.
+
+    Media Foundation, which Qt uses, shares a camera: Teams could still pick the real one
+    next to the virtual one. A camera opened through DirectShow gives other apps no
+    frames, so they report it as in use and the virtual camera is the only working choice.
+    """
+
+    def __init__(self, width: int, height: int, fps: int) -> None:
+        self.size = (width, height, fps)
+        self.latest: np.ndarray | None = None
+        self.stop = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def devices(self, exclude: str) -> list[str]:
+        from .dshow import video_inputs
+
+        return real_cameras(video_inputs(), exclude)
+
+    def open(self, name: str, exclude: str) -> str | None:
+        from .dshow import video_inputs
+
+        self.close()
+        all_names = video_inputs()
+        choices = real_cameras(all_names, exclude)
+        chosen = name if name in choices else (choices[0] if choices else None)
+        if chosen is None:
+            return None
+        self.stop.clear()
+        self.thread = threading.Thread(target=self._capture, args=(all_names.index(chosen),), daemon=True)
+        self.thread.start()
+        return chosen
+
+    def _capture(self, index: int) -> None:
+        capture = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+        width, height, _fps = self.size
+        # MJPG: most USB cameras only reach 720p/1080p at full frame rate compressed. The order
+        # matters on DirectShow: a size change after the format falls back to raw YUY2 at ~9 fps,
+        # and so does setting the frame rate, so it is left to the camera.
+        capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        try:
+            while not self.stop.is_set():
+                ok, frame = capture.read()
+                self.latest = frame if ok else None
+                if not ok:
+                    self.stop.wait(0.5)
+        finally:
+            capture.release()
+
+    def close(self) -> None:
+        self.stop.set()
+        if self.thread is not None:
+            self.thread.join(timeout=2)
+        self.thread = None
+        self.latest = None
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.settings = config_module.load()
         self.setWindowTitle("PresenceCam")
-        self.camera_input = CameraInput()
+        self.camera_input = self._make_input()
         backend, device = driver.backend(self.settings.camera_name)
         self.engine = Engine(
             EngineConfig(
@@ -197,6 +264,12 @@ class MainWindow(QMainWindow):
         self.hint = QLabel(driver.setup_hint(self.settings.camera_name))
         self.hint.setWordWrap(True)
         layout.addWidget(self.hint, 3, 0, 1, 2)
+        if sys.platform == "win32":
+            self.lock_box = QCheckBox("Zajmij prawdziwą kamerę (inne programy widzą ją jako zajętą)")
+            self.lock_box.setToolTip("Teams i inne programy nie mogą wtedy wybrać prawdziwej kamery, tylko wirtualną.")
+            self.lock_box.setChecked(self.settings.lock_input)
+            self.lock_box.toggled.connect(self._set_lock)
+            layout.addWidget(self.lock_box, 4, 0, 1, 2)
         return group
 
     # --- actions ---
@@ -230,8 +303,8 @@ class MainWindow(QMainWindow):
     def _open_input(self, name: str) -> None:
         chosen = self.camera_input.open(name, self.settings.camera_name)
         self.input_combo.clear()
-        for device in CameraInput.devices(self.settings.camera_name):
-            self.input_combo.addItem(device.description())
+        for name in self.camera_input.devices(self.settings.camera_name):
+            self.input_combo.addItem(name)
         if chosen:
             self.input_combo.setCurrentText(chosen)
         else:
@@ -241,6 +314,18 @@ class MainWindow(QMainWindow):
         self.settings.input_device = name
         self._guard(lambda: config_module.save(self.settings))
         self._open_input(name)
+
+    def _make_input(self) -> CameraInput | LockedCameraInput:
+        if sys.platform == "win32" and self.settings.lock_input:
+            return LockedCameraInput(self.settings.width, self.settings.height, self.settings.fps)
+        return CameraInput()
+
+    def _set_lock(self, locked: bool) -> None:
+        self.settings.lock_input = locked
+        self._guard(lambda: config_module.save(self.settings))
+        self.camera_input.close()
+        self.camera_input = self._make_input()
+        self._open_input(self.settings.input_device)
 
     def _install_camera(self) -> None:
         name = self.name_edit.text().strip()
@@ -298,8 +383,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
         self.engine.stopped.set()
         self.engine_thread.join(timeout=2)
-        if self.camera_input.camera is not None:
-            self.camera_input.camera.stop()
+        self.camera_input.close()
         super().closeEvent(event)
 
 

@@ -5,10 +5,11 @@ Aplikacja desktopowa: kamera USB → **wirtualna kamera o Twojej nazwie**, widoc
 ## Co umie
 
 - **Na żywo**: obraz z kamery przechodzi bez zmian.
-- **Pętla z nagrania**: nagrywasz 15/30/60 s siebie „skupionego”, potem klawisz `P` przełącza na pętlę. Przejście to przenikanie (0,6 s), a pętla idzie tam i z powrotem, więc nie ma skoku. Powrót: `L`.
+- **Pętla z nagrania**: nagrywasz 15/30/60 s siebie „skupionego”, potem klawisz `P` przełącza na pętlę. Przełączenie wygląda jak chwilowy problem z łączem (zamrożenie 1–2,5 s, potem rozmyty obraz z przycięciem, który się wyostrza), więc nie widać skoku między nagraniem a obrazem na żywo. Pętla idzie tam i z powrotem. Powrót: `L`.
 - **Problemy z połączeniem** (na żywo i na pętli): **Zamrożenie** `F`, **Słaby internet** `W` (rozmyty obraz o niskiej rozdzielczości, nierówne 5–12 kl./s, krótkie zawieszki), **Przycinanie** `C` (stop na 1–4 s co jakiś czas), **Brak** `N`.
 - **Nazwa kamery**: wpisujesz w aplikacji, np. „HD Webcam”; tak ją widzą wszystkie programy (Windows, Linux).
 - Kamerę wejściową wybierasz po nazwie. Własna wirtualna kamera nigdy nie jest proponowana jako wejście.
+- **Zajęta prawdziwa kamera** (Windows, domyślnie włączone): póki PresenceCam działa, trzyma prawdziwą kamerę na wyłączność, więc Teams i inne programy widzą ją jako zajętą i mogą użyć tylko wirtualnej. Wyłączasz to w Ustawieniach.
 
 ## Windows 11
 
@@ -43,7 +44,7 @@ Plik `config.json` (edytowalny ręcznie, aplikacja ignoruje błędne wartości):
 | macOS | `~/Library/Application Support/PresenceCam/config.json` |
 | Linux | `~/.config/presencecam/config.json` |
 
-Pola: `camera_name`, `input_device` (nazwa kamery wejściowej), `width`, `height`, `fps`, `clips_dir` (domyślnie folder `clips` obok pliku).
+Pola: `camera_name`, `input_device` (nazwa kamery wejściowej), `lock_input` (`true`/`false`, zajmowanie prawdziwej kamery), `width`, `height`, `fps`, `clips_dir` (domyślnie folder `clips` obok pliku).
 
 ## Jak tego używać
 
