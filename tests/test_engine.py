@@ -26,14 +26,31 @@ class GlitcherTest(unittest.TestCase):
         glitcher.set_mode("freeze")
         self.assertTrue((glitcher.apply(frame(200), 1.0) == 10).all())
 
-    def test_weak_drops_to_about_eight_fps_and_degrades_the_picture(self):
+    def test_weak_blurs_instead_of_pixelating(self):
         glitcher = Glitcher(random.Random(1))
         glitcher.set_mode("weak")
-        gradient = np.dstack([np.tile(np.arange(128, dtype=np.uint8), (72, 1))] * 3)
-        out = [glitcher.apply(gradient, step / 30) for step in range(30)]  # first second, before any stall
-        distinct = {id(item) for item in out}
-        self.assertLessEqual(len(distinct), 9)
-        self.assertFalse(np.array_equal(out[0], gradient))
+        checker = np.dstack([np.indices((72, 128)).sum(axis=0) % 2 * 255] * 3).astype(np.uint8)
+        sent = [out for out in (glitcher.apply(checker, step / 30) for step in range(90)) if out is not checker]
+        self.assertTrue(sent)
+        # Fine detail is lost to blur: no hard 0/255 edges survive, as they would with pixel squares.
+        for out in sent:
+            self.assertLess(np.abs(np.diff(out.astype(int), axis=1)).max(), 128)
+
+    def test_weak_jumps_between_better_and_worse_with_freezes(self):
+        glitcher = Glitcher(random.Random(4))
+        glitcher.set_mode("weak")
+        levels, frames = [], []
+        for step in range(30 * 60):  # one minute at 30 fps
+            frames.append(id(glitcher.apply(frame(step % 250), step / 30)))
+            levels.append(glitcher.level)
+        changes = [b - a for a, b in zip(levels, levels[1:]) if a != b]
+        self.assertTrue(any(c > 0 for c in changes) and any(c <= -2 for c in changes))  # climbs, then drops hard
+        # Freezes: runs of the same picture longer than 0.4 s.
+        runs, run = [], 1
+        for a, b in zip(frames, frames[1:]):
+            run = run + 1 if a == b else (runs.append(run) or 1)
+        self.assertGreaterEqual(sum(r > 12 for r in runs), 3)
+        self.assertLess(len(set(frames)), 15 * 60)  # never full frame rate
 
     def test_choppy_stalls_for_seconds_then_recovers(self):
         glitcher = Glitcher(random.Random(2))

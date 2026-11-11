@@ -16,6 +16,8 @@ import numpy as np
 SOURCES = ("live", "loop")
 GLITCHES = ("none", "freeze", "weak", "choppy")
 FADE_SECONDS = 0.6
+# Resolution steps (fraction of the full size) a sender moves between on a weak link.
+WEAK_LEVELS = (0.07, 0.1, 0.15, 0.22, 0.32, 0.45, 0.65)
 
 
 def pingpong_index(step: int, length: int) -> int:
@@ -36,8 +38,8 @@ def crossfade(old: np.ndarray, new: np.ndarray, progress: float) -> np.ndarray:
 class Glitcher:
     """Turns a clean frame stream into a believable bad call.
 
-    freeze: the picture stops.  weak: blocky, low frame rate, short stalls (poor
-    connection).  choppy: normal picture that stalls for 1-4 s every so often.
+    freeze: the picture stops.  weak: quality jumps up and down with freezes, like a
+    sender fighting a bad link.  choppy: normal picture that stalls for 1-4 s every so often.
     """
 
     def __init__(self, rng: random.Random | None = None) -> None:
@@ -47,11 +49,17 @@ class Glitcher:
         self.stall_until = 0.0
         self.next_stall = 0.0
         self.next_frame_at = 0.0
+        self.set_mode("none")
 
     def set_mode(self, mode: str) -> None:
         self.mode = mode
         self.stall_until = 0.0
         self.next_stall = 0.0
+        # weak: start mid-way, as if the link just got worse.
+        self.level = 2
+        self.capacity = 2.5
+        self.next_capacity_at = 0.0
+        self.next_probe_at = 0.0
 
     def apply(self, frame: np.ndarray, now: float) -> np.ndarray:
         if self.mode == "none":
@@ -64,26 +72,54 @@ class Glitcher:
 
         if now < self.stall_until and self.held is not None:
             return self.held
+        if self.mode == "weak":
+            return self._weak(frame, now)
         if self.next_stall == 0.0:
             self.next_stall = now + self.rng.uniform(3, 8)
         if now >= self.next_stall:
-            short = self.mode == "weak"
-            self.stall_until = now + (self.rng.uniform(0.3, 1.5) if short else self.rng.uniform(1.0, 4.0))
-            self.next_stall = self.stall_until + (self.rng.uniform(2, 6) if short else self.rng.uniform(5, 15))
+            self.stall_until = now + self.rng.uniform(1.0, 4.0)
+            self.next_stall = self.stall_until + self.rng.uniform(5, 15)
             return self.held if self.held is not None else frame
 
-        if self.mode == "weak":
-            # ~8 fps, blocky and over-compressed, like a video call on a bad link.
-            if now < self.next_frame_at and self.held is not None:
-                return self.held
-            self.next_frame_at = now + 1 / 8
-            height, width = frame.shape[:2]
-            factor = self.rng.choice((6, 8, 10))
-            small = cv2.resize(frame, (max(1, width // factor), max(1, height // factor)), interpolation=cv2.INTER_AREA)
-            blocky = cv2.resize(small, (width, height), interpolation=cv2.INTER_NEAREST)
-            ok, encoded = cv2.imencode(".jpg", blocky, [cv2.IMWRITE_JPEG_QUALITY, 8])
-            frame = cv2.imdecode(encoded, cv2.IMREAD_COLOR) if ok else blocky
+        self.held = frame
+        return frame
 
+    def _weak(self, frame: np.ndarray, now: float) -> np.ndarray:
+        """A call on a bad link, modelled on how video calls adapt to bandwidth.
+
+        The sender keeps stepping its resolution up to probe for more bandwidth. When it
+        overshoots what the link carries right now, the picture freezes while the queue
+        drains, then comes back much worse and climbs again. The link itself also changes
+        in jumps, so a good stretch can collapse at any moment. Quality changes are steps,
+        never smooth: that is what makes it read as a connection and not as a filter.
+        """
+        if now >= self.next_capacity_at:
+            self.capacity = self.rng.uniform(1.0, len(WEAK_LEVELS) - 0.3)
+            self.next_capacity_at = now + self.rng.uniform(1.5, 6)
+        if now >= self.next_probe_at:
+            self.level = min(self.level + 1, len(WEAK_LEVELS) - 1)
+            self.next_probe_at = now + self.rng.uniform(0.4, 1.2)
+        if self.level > self.capacity:
+            # Congestion: the picture stops, then the sender backs off hard.
+            self.stall_until = now + self.rng.uniform(0.4, 2.5)
+            self.level = max(0, self.level - self.rng.choice((2, 2, 3, 4)))
+            self.next_probe_at = self.stall_until + self.rng.uniform(0.5, 1.5)
+            return self.held if self.held is not None else frame
+
+        # Near the limit frames come late and unevenly; with headroom they flow better.
+        near_limit = self.capacity - self.level < 1
+        if now < self.next_frame_at and self.held is not None:
+            return self.held
+        self.next_frame_at = now + 1 / (self.rng.uniform(4, 10) if near_limit else self.rng.uniform(10, 20))
+
+        scale = WEAK_LEVELS[self.level]
+        height, width = frame.shape[:2]
+        small = cv2.resize(frame, (max(16, int(width * scale)), max(9, int(height * scale))), interpolation=cv2.INTER_AREA)
+        # Compressed at the low resolution and scaled up smoothly, as a real decoder does: blur, not squares.
+        ok, encoded = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 20 if near_limit else 45])
+        if ok:
+            small = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+        frame = cv2.resize(small, (width, height), interpolation=cv2.INTER_LINEAR)
         self.held = frame
         return frame
 

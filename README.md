@@ -6,7 +6,7 @@ Aplikacja desktopowa: kamera USB → **wirtualna kamera o Twojej nazwie**, widoc
 
 - **Na żywo**: obraz z kamery przechodzi bez zmian.
 - **Pętla z nagrania**: nagrywasz 15/30/60 s siebie „skupionego”, potem klawisz `P` przełącza na pętlę. Przejście to przenikanie (0,6 s), a pętla idzie tam i z powrotem, więc nie ma skoku. Powrót: `L`.
-- **Problemy z połączeniem** (na żywo i na pętli): **Zamrożenie** `F`, **Słaby internet** `W` (kwadraty, ~8 kl./s, krótkie zawieszki), **Przycinanie** `C` (stop na 1–4 s co jakiś czas), **Brak** `N`.
+- **Problemy z połączeniem** (na żywo i na pętli): **Zamrożenie** `F`, **Słaby internet** `W` (rozmyty obraz o niskiej rozdzielczości, nierówne 5–12 kl./s, krótkie zawieszki), **Przycinanie** `C` (stop na 1–4 s co jakiś czas), **Brak** `N`.
 - **Nazwa kamery**: wpisujesz w aplikacji, np. „HD Webcam”; tak ją widzą wszystkie programy (Windows, Linux).
 - Kamerę wejściową wybierasz po nazwie. Własna wirtualna kamera nigdy nie jest proponowana jako wejście.
 
