@@ -23,12 +23,16 @@ jobs:
 
       - name: Fetch the Unity Capture driver (MIT)
         shell: bash
+        # Pinned commit and checksums: a changed upstream file fails the build instead of shipping.
         run: |
-          git clone --depth 1 https://github.com/schellingb/UnityCapture unitycapture
+          git clone https://github.com/schellingb/UnityCapture unitycapture
+          git -C unitycapture checkout --quiet 3ed54c325e0ad71afcf4f246c07e5e17b3d7f2d2
           cp unitycapture/Install/UnityCaptureFilter32.dll unitycapture/Install/UnityCaptureFilter64.dll drivers/windows/
           cp unitycapture/LICENSE drivers/windows/UnityCapture-LICENSE.txt || true
-          git -C unitycapture log -1 --format="Unity Capture commit %H (%cs)"
-          sha256sum drivers/windows/*.dll
+          sha256sum -c - <<'SUMS'
+          aa3ebdf03dea7f3aab3dd7b724751f49ed71672256b57c6a19aa6809cabf30ba  drivers/windows/UnityCaptureFilter32.dll
+          72812f5363d8ecb45632253f8c8c888844b1b62e27616f3c8cc21064ccde25e5  drivers/windows/UnityCaptureFilter64.dll
+          SUMS
 
       - name: Build PresenceCam.exe
         run: >
