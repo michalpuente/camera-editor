@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from presencecam.engine import Engine, EngineConfig, Glitcher, pingpong_index, test_pattern
+from presencecam.engine import Engine, EngineConfig, Glitcher, SwitchCover, pingpong_index, test_pattern
 
 
 def frame(value: int) -> np.ndarray:
@@ -60,6 +60,20 @@ class GlitcherTest(unittest.TestCase):
         self.assertFalse(all(held))
 
 
+class SwitchCoverTest(unittest.TestCase):
+    def test_freezes_then_comes_back_blurry_then_clean(self):
+        old = frame(10)
+        cover = SwitchCover(old, 0.0, random.Random(5))
+        checker = np.dstack([np.indices((72, 128)).sum(axis=0) % 2 * 255] * 3).astype(np.uint8)
+        # At least 1.2 s of the old picture: the switch happens behind the freeze.
+        self.assertTrue(all(cover.apply(checker, step / 30) is old for step in range(36)))
+        back = [cover.apply(checker, step / 30) for step in range(36, 150) if not cover.done(step / 30)]
+        recovered = [out for out in back if out is not old]
+        self.assertTrue(recovered)
+        self.assertLess(np.abs(np.diff(recovered[0].astype(int), axis=1)).max(), 128)  # blurry first
+        self.assertTrue(cover.done(5.0))  # and over within about 4.5 s
+
+
 class EngineTest(unittest.TestCase):
     def test_records_a_clip_and_loops_it(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -76,7 +90,7 @@ class EngineTest(unittest.TestCase):
             self.assertTrue((Path(directory) / f"{name}.mp4").exists())
             self.assertEqual(engine.state()["clips"][0]["name"], name)
             engine.set_source("loop")
-            time.sleep(0.7)  # let the cross-fade finish
+            engine.cover = None  # the switch cover has its own test
             outputs = [int(engine._frame(time.monotonic(), frame(255)).mean()) for _ in range(8)]
             # The recorded frames forward then back, never the live 255.
             self.assertEqual(outputs, [0, 40, 80, 120, 160, 250, 160, 120])

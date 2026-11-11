@@ -15,7 +15,6 @@ import numpy as np
 
 SOURCES = ("live", "loop")
 GLITCHES = ("none", "freeze", "weak", "choppy")
-FADE_SECONDS = 0.6
 # Resolution steps (fraction of the full size) a sender moves between on a weak link.
 WEAK_LEVELS = (0.07, 0.1, 0.15, 0.22, 0.32, 0.45, 0.65)
 
@@ -29,10 +28,55 @@ def pingpong_index(step: int, length: int) -> int:
     return position if position < length else period - position
 
 
-def crossfade(old: np.ndarray, new: np.ndarray, progress: float) -> np.ndarray:
-    if old.shape != new.shape:
-        old = cv2.resize(old, (new.shape[1], new.shape[0]))
-    return cv2.addWeighted(old, 1.0 - progress, new, progress, 0)
+def low_bandwidth(frame: np.ndarray, scale: float, quality: int) -> np.ndarray:
+    """The picture a video call shows when it sends at a fraction of the resolution.
+
+    Compressed at the low resolution and scaled up smoothly, as a real decoder does:
+    blur and smudges, not pixel squares.
+    """
+    height, width = frame.shape[:2]
+    small = cv2.resize(frame, (max(16, int(width * scale)), max(9, int(height * scale))), interpolation=cv2.INTER_AREA)
+    ok, encoded = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if ok:
+        small = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+    return cv2.resize(small, (width, height), interpolation=cv2.INTER_LINEAR)
+
+
+class SwitchCover:
+    """Hides a live <-> loop switch behind what looks like a short connection hiccup.
+
+    A cut or a cross-fade between two takes is easy to spot. A call that freezes, comes
+    back blurry with a stutter and then sharpens is something everyone has seen, and the
+    jump in position between the two takes disappears inside it.
+    """
+
+    def __init__(self, held: np.ndarray | None, start: float, rng: random.Random) -> None:
+        self.held = held
+        self.rng = rng
+        self.freeze_until = start + rng.uniform(1.2, 2.5)
+        self.recover_until = self.freeze_until + rng.uniform(1.0, 2.0)
+        stutter_at = rng.uniform(self.freeze_until + 0.2, self.recover_until - 0.4)
+        self.stutter = (stutter_at, stutter_at + rng.uniform(0.2, 0.5))
+        self.next_frame_at = 0.0
+
+    def frozen(self, now: float) -> bool:
+        return now < self.freeze_until
+
+    def done(self, now: float) -> bool:
+        return now >= self.recover_until
+
+    def apply(self, frame: np.ndarray, now: float) -> np.ndarray:
+        if self.held is None:
+            self.held = frame
+        stuttering = self.stutter[0] <= now < self.stutter[1]
+        if self.frozen(now) or stuttering or now < self.next_frame_at:
+            return self.held
+        # Back from the freeze: low resolution first, stepping up as the link "recovers".
+        progress = (now - self.freeze_until) / (self.recover_until - self.freeze_until)
+        level = min(len(WEAK_LEVELS) - 1, int(progress * len(WEAK_LEVELS)))
+        self.held = low_bandwidth(frame, WEAK_LEVELS[level], 25 if progress < 0.5 else 45)
+        self.next_frame_at = now + 1 / self.rng.uniform(8, 15)
+        return self.held
 
 
 class Glitcher:
@@ -112,14 +156,7 @@ class Glitcher:
             return self.held
         self.next_frame_at = now + 1 / (self.rng.uniform(4, 10) if near_limit else self.rng.uniform(10, 20))
 
-        scale = WEAK_LEVELS[self.level]
-        height, width = frame.shape[:2]
-        small = cv2.resize(frame, (max(16, int(width * scale)), max(9, int(height * scale))), interpolation=cv2.INTER_AREA)
-        # Compressed at the low resolution and scaled up smoothly, as a real decoder does: blur, not squares.
-        ok, encoded = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 20 if near_limit else 45])
-        if ok:
-            small = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
-        frame = cv2.resize(small, (width, height), interpolation=cv2.INTER_LINEAR)
+        frame = low_bandwidth(frame, WEAK_LEVELS[self.level], 20 if near_limit else 45)
         self.held = frame
         return frame
 
@@ -175,8 +212,7 @@ class Engine:
         self.active_clip: str | None = None
         self.recording: Recording | None = None
         self.loop_step = 0
-        self.fade_from: np.ndarray | None = None
-        self.fade_started = 0.0
+        self.cover: SwitchCover | None = None
         self.last_output: np.ndarray | None = None
         self.output_frame: np.ndarray | None = None
         self.stopped = threading.Event()
@@ -198,9 +234,7 @@ class Engine:
             if source == "loop" and self.active_clip is None:
                 raise ValueError("Najpierw nagraj albo wybierz nagranie do pętli")
             if source != self.source or clip is not None:
-                # Cross-fade from what viewers see now, so the switch has no visible cut.
-                self.fade_from = self.last_output
-                self.fade_started = time.monotonic()
+                self.cover = SwitchCover(self.last_output, time.monotonic(), self.glitcher.rng)
                 self.loop_step = 0
             self.source = source
 
@@ -291,7 +325,7 @@ class Engine:
             return None
 
     def _frame(self, now: float, live: np.ndarray) -> np.ndarray:
-        """Picks what goes out (live or loop), fades between them, then glitches it."""
+        """Picks what goes out (live or loop), covers a switch between them, then glitches it."""
         with self.lock:
             if self.recording is not None:
                 self.recording.writer.write(live)
@@ -303,19 +337,20 @@ class Engine:
                     self.active_clip = clip.name
                     self.recording = None
 
+            if self.cover is not None and self.cover.done(now):
+                self.cover = None
+
             frame = live
-            if self.source == "loop" and self.active_clip in self.clips:
+            # While frozen the loop waits, so viewers see it from its first frame.
+            loop_paused = self.cover is not None and self.cover.frozen(now)
+            if self.source == "loop" and self.active_clip in self.clips and not loop_paused:
                 frames = self.clips[self.active_clip].frames
                 encoded = frames[pingpong_index(self.loop_step, len(frames))]
                 frame = cv2.imdecode(np.frombuffer(encoded, np.uint8), cv2.IMREAD_COLOR)
                 self.loop_step += 1
 
-            if self.fade_from is not None:
-                progress = (time.monotonic() - self.fade_started) / FADE_SECONDS
-                if progress >= 1:
-                    self.fade_from = None
-                else:
-                    frame = crossfade(self.fade_from, frame, progress)
+            if self.cover is not None:
+                frame = self.cover.apply(frame, now)
 
             frame = self.glitcher.apply(frame, now)
             self.last_output = frame
