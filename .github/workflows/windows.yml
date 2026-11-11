@@ -1,0 +1,43 @@
+name: Windows build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Tests
+        run: python -m unittest discover -s tests
+
+      - name: Fetch the Unity Capture driver (MIT)
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/schellingb/UnityCapture unitycapture
+          cp unitycapture/Install/UnityCaptureFilter32.dll unitycapture/Install/UnityCaptureFilter64.dll drivers/windows/
+          cp unitycapture/LICENSE drivers/windows/UnityCapture-LICENSE.txt || true
+          git -C unitycapture log -1 --format="Unity Capture commit %H (%cs)"
+          sha256sum drivers/windows/*.dll
+
+      - name: Build PresenceCam.exe
+        run: >
+          pyinstaller --noconfirm --windowed --name PresenceCam
+          --add-data "drivers/windows;drivers/windows"
+          --collect-submodules PySide6.QtMultimedia
+          run.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PresenceCam-windows
+          path: dist/PresenceCam

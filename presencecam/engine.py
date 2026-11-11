@@ -5,6 +5,7 @@ from __future__ import annotations
 import random
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -113,12 +114,15 @@ class Recording:
 
 @dataclass
 class EngineConfig:
-    camera: int = 0
     width: int = 1280
     height: int = 720
     fps: int = 30
     clips_dir: Path = Path("clips")
-    virtual_camera: bool = True
+    # Latest frame from the real camera (BGR), or None when there is none yet.
+    read_frame: Callable[[], np.ndarray | None] = lambda: None
+    # pyvirtualcam backend and device name; backend None = preview only.
+    virtual_backend: str | None = None
+    virtual_device: str | None = None
 
 
 @dataclass
@@ -134,12 +138,13 @@ class Engine:
         self.clips: dict[str, Clip] = {}
         self.active_clip: str | None = None
         self.recording: Recording | None = None
-        self.preview_jpeg = b""
         self.loop_step = 0
         self.fade_from: np.ndarray | None = None
         self.fade_started = 0.0
         self.last_output: np.ndarray | None = None
+        self.output_frame: np.ndarray | None = None
         self.stopped = threading.Event()
+        self.reopen_virtual = threading.Event()
         self.config.clips_dir.mkdir(parents=True, exist_ok=True)
         for path in sorted(self.config.clips_dir.glob("*.mp4")):
             self._load_clip(path)
@@ -149,13 +154,13 @@ class Engine:
     def set_source(self, source: str, clip: str | None = None) -> None:
         with self.lock:
             if source not in SOURCES:
-                raise ValueError(f"source must be one of {SOURCES}")
+                raise ValueError(f"źródło musi być jednym z {SOURCES}")
             if clip is not None:
                 if clip not in self.clips:
-                    raise ValueError(f"unknown clip {clip!r}")
+                    raise ValueError(f"nie ma nagrania {clip!r}")
                 self.active_clip = clip
             if source == "loop" and self.active_clip is None:
-                raise ValueError("record or pick a clip first")
+                raise ValueError("Najpierw nagraj albo wybierz nagranie do pętli")
             if source != self.source or clip is not None:
                 # Cross-fade from what viewers see now, so the switch has no visible cut.
                 self.fade_from = self.last_output
@@ -166,16 +171,16 @@ class Engine:
     def set_glitch(self, glitch: str) -> None:
         with self.lock:
             if glitch not in GLITCHES:
-                raise ValueError(f"glitch must be one of {GLITCHES}")
+                raise ValueError(f"efekt musi być jednym z {GLITCHES}")
             self.glitch = glitch
             self.glitcher.set_mode(glitch)
 
     def start_recording(self, seconds: float) -> str:
         with self.lock:
             if self.recording is not None:
-                raise ValueError("already recording")
+                raise ValueError("Nagrywanie już trwa")
             if not 3 <= seconds <= 300:
-                raise ValueError("seconds must be between 3 and 300")
+                raise ValueError("Długość nagrania: od 3 do 300 s")
             name = datetime.now().strftime("clip-%Y%m%d-%H%M%S")
             path = self.config.clips_dir / f"{name}.mp4"
             writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), self.config.fps, (self.config.width, self.config.height))
@@ -185,9 +190,9 @@ class Engine:
     def delete_clip(self, name: str) -> None:
         with self.lock:
             if name not in self.clips:
-                raise ValueError(f"unknown clip {name!r}")
+                raise ValueError(f"nie ma nagrania {name!r}")
             if self.source == "loop" and self.active_clip == name:
-                raise ValueError("switch back to live before deleting the clip on air")
+                raise ValueError("Najpierw wróć na żywo, to nagranie jest teraz w pętli")
             del self.clips[name]
             if self.active_clip == name:
                 self.active_clip = None
@@ -222,27 +227,31 @@ class Engine:
             self.clips[path.stem] = Clip(path.stem, frames)
             self.active_clip = self.active_clip or path.stem
 
-    def _open_camera(self) -> cv2.VideoCapture | None:
-        capture = cv2.VideoCapture(self.config.camera)
-        if not capture.isOpened():
-            return None
-        capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.width)
-        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.height)
-        capture.set(cv2.CAP_PROP_FPS, self.config.fps)
-        return capture
+    def set_virtual_device(self, backend: str | None, device: str | None) -> None:
+        """Switches the virtual camera (e.g. after a rename); the pipeline reopens it."""
+        self.config.virtual_backend = backend
+        self.config.virtual_device = device
+        self.reopen_virtual.set()
 
     def _open_virtual_camera(self):
-        if not self.config.virtual_camera:
-            self.status["virtualCamera"] = "off (--no-virtual)"
+        if self.config.virtual_backend is None:
+            self.status["virtualCamera"] = "wyłączona"
             return None
         try:
             import pyvirtualcam
 
-            camera = pyvirtualcam.Camera(self.config.width, self.config.height, self.config.fps, fmt=pyvirtualcam.PixelFormat.BGR)
-            self.status["virtualCamera"] = f"on: {camera.device}"
+            camera = pyvirtualcam.Camera(
+                self.config.width,
+                self.config.height,
+                self.config.fps,
+                fmt=pyvirtualcam.PixelFormat.BGR,
+                backend=self.config.virtual_backend,
+                device=self.config.virtual_device,
+            )
+            self.status["virtualCamera"] = f"działa: {camera.device}"
             return camera
         except Exception as error:  # noqa: BLE001 - any backend failure means preview-only mode
-            self.status["virtualCamera"] = f"unavailable: {error}"
+            self.status["virtualCamera"] = f"niedostępna: {error}"
             return None
 
     def _frame(self, now: float, live: np.ndarray) -> np.ndarray:
@@ -277,38 +286,33 @@ class Engine:
             return frame
 
     def run(self) -> None:
-        camera = self._open_camera()
-        self.status["camera"] = f"camera {self.config.camera}" if camera else "no camera found: showing a test pattern"
         virtual = self._open_virtual_camera()
         interval = 1 / self.config.fps
-        next_preview = 0.0
         try:
             while not self.stopped.is_set():
                 started = time.monotonic()
-                live = None
-                if camera is not None:
-                    ok, live = camera.read()
-                    if not ok:
-                        live = None
+                if self.reopen_virtual.is_set():
+                    self.reopen_virtual.clear()
+                    if virtual is not None:
+                        virtual.close()
+                    virtual = self._open_virtual_camera()
+
+                live = self.config.read_frame()
+                self.status["camera"] = "kamera działa" if live is not None else "brak kamery, obraz testowy"
                 if live is None:
                     live = test_pattern(self.config.width, self.config.height, started)
                 elif live.shape[:2] != (self.config.height, self.config.width):
                     live = cv2.resize(live, (self.config.width, self.config.height))
 
                 frame = self._frame(started, live)
+                self.output_frame = frame
                 if virtual is not None:
-                    virtual.send(frame)
-                if started >= next_preview:
-                    # ~10 fps preview is plenty for the panel and keeps CPU low.
-                    next_preview = started + 0.1
-                    preview = cv2.resize(frame, (640, int(640 * frame.shape[0] / frame.shape[1])))
-                    self.preview_jpeg = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, 70])[1].tobytes()
-                if virtual is not None:
-                    virtual.sleep_until_next_frame()
-                elif camera is None:
-                    time.sleep(max(0.0, interval - (time.monotonic() - started)))
+                    try:
+                        virtual.send(frame)
+                    except Exception as error:  # noqa: BLE001 - e.g. the driver was removed; keep previewing
+                        self.status["virtualCamera"] = f"utracona: {error}"
+                        virtual = None
+                time.sleep(max(0.0, interval - (time.monotonic() - started)))
         finally:
-            if camera is not None:
-                camera.release()
             if virtual is not None:
                 virtual.close()

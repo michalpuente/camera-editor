@@ -2,3 +2,7 @@
 clips/
 __pycache__/
 *.pyc
+build/
+dist/
+*.spec
+drivers/windows/*.dll

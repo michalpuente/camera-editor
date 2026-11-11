@@ -46,7 +46,7 @@ class GlitcherTest(unittest.TestCase):
 class EngineTest(unittest.TestCase):
     def test_records_a_clip_and_loops_it(self):
         with tempfile.TemporaryDirectory() as directory:
-            engine = Engine(EngineConfig(width=128, height=72, clips_dir=Path(directory), virtual_camera=False))
+            engine = Engine(EngineConfig(width=128, height=72, clips_dir=Path(directory)))
             with self.assertRaises(ValueError):
                 engine.set_source("loop")
 
@@ -70,14 +70,14 @@ class EngineTest(unittest.TestCase):
 
     def test_reloads_saved_clips_at_start(self):
         with tempfile.TemporaryDirectory() as directory:
-            first = Engine(EngineConfig(width=128, height=72, clips_dir=Path(directory), virtual_camera=False))
+            first = Engine(EngineConfig(width=128, height=72, clips_dir=Path(directory)))
             name = first.start_recording(3)
             start = time.monotonic()
             for step in range(4):
                 first._frame(start, test_pattern(128, 72, step))
             first._frame(start + 10, test_pattern(128, 72, 9))
 
-            second = Engine(EngineConfig(width=128, height=72, clips_dir=Path(directory), virtual_camera=False))
+            second = Engine(EngineConfig(width=128, height=72, clips_dir=Path(directory)))
             self.assertEqual(second.state()["activeClip"], name)
 
 
