@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PresenceCam</title>
+<style>
+  :root { color-scheme: light dark; --accent: #2b7cc4; --bg: #f4f5f7; --card: #fff; --text: #1a1a1a; --muted: #667; --line: #dde; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #111418; --card: #1b2027; --text: #e8eaed; --muted: #9aa3ad; --line: #2c333c; } }
+  body { margin: 0; font-family: system-ui, sans-serif; background: var(--bg); color: var(--text); }
+  main { max-width: 900px; margin: 0 auto; padding: 16px; display: grid; gap: 14px; }
+  h1 { margin: 0; font-size: 1.4rem; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px; display: grid; gap: 10px; }
+  .card h2 { margin: 0; font-size: 1rem; }
+  img { width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 8px; object-fit: contain; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  button { font: inherit; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--text); cursor: pointer; min-height: 44px; }
+  button.on { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button.danger { color: #c62828; }
+  .muted { color: var(--muted); font-size: 0.85rem; }
+  .pill { padding: 2px 10px; border-radius: 99px; background: var(--line); font-size: 0.85rem; font-weight: 600; }
+  .pill.rec { background: #c62828; color: #fff; }
+  .clip { display: flex; gap: 8px; align-items: center; justify-content: space-between; border-top: 1px solid var(--line); padding-top: 8px; }
+  #error { color: #c62828; min-height: 1.2em; margin: 0; }
+  kbd { font-size: 0.75rem; border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
+</style>
+</head>
+<body>
+<main>
+  <div class="row" style="justify-content: space-between">
+    <h1>PresenceCam</h1>
+    <span id="badges" class="row"></span>
+  </div>
+
+  <div class="card">
+    <img src="/preview.mjpg" alt="Podgląd tego, co widzą inni">
+    <span class="muted" id="status"></span>
+  </div>
+
+  <div class="card">
+    <h2>Co widzą inni</h2>
+    <div class="row">
+      <button data-source="live">Na żywo <kbd>L</kbd></button>
+      <button data-source="loop">Pętla z nagrania <kbd>P</kbd></button>
+    </div>
+    <span class="muted">Przejście jest płynne (krótkie przenikanie), a pętla odtwarza się tam i z powrotem, więc nie ma skoku na jej końcu.</span>
+  </div>
+
+  <div class="card">
+    <h2>Problemy z połączeniem</h2>
+    <div class="row">
+      <button data-glitch="none">Brak <kbd>N</kbd></button>
+      <button data-glitch="freeze">Zamrożenie <kbd>F</kbd></button>
+      <button data-glitch="weak">Słaby internet <kbd>W</kbd></button>
+      <button data-glitch="choppy">Przycinanie <kbd>C</kbd></button>
+    </div>
+    <span class="muted">Działa i na żywym obrazie, i na pętli.</span>
+  </div>
+
+  <div class="card">
+    <h2>Nagrania do pętli</h2>
+    <div class="row">
+      <button data-record="15">Nagraj 15 s</button>
+      <button data-record="30">Nagraj 30 s</button>
+      <button data-record="60">Nagraj 60 s</button>
+    </div>
+    <span class="muted">Patrz w ekran, czasem kiwnij głową, nie mów. Nagranie od razu staje się aktywną pętlą.</span>
+    <div id="clips"></div>
+  </div>
+
+  <p id="error" role="alert"></p>
+</main>
+<script>
+  const $ = (selector) => document.querySelector(selector);
+  let state = null;
+
+  async function call(path, body) {
+    const response = await fetch(path, { method: body ? "POST" : "GET", headers: { "Content-Type": "application/json" }, body: body && JSON.stringify(body) });
+    const data = await response.json();
+    $("#error").textContent = response.ok ? "" : data.error;
+    if (response.ok) render(data);
+  }
+
+  function render(next) {
+    state = next;
+    document.querySelectorAll("[data-source]").forEach((b) => b.classList.toggle("on", b.dataset.source === state.source));
+    document.querySelectorAll("[data-glitch]").forEach((b) => b.classList.toggle("on", b.dataset.glitch === state.glitch));
+    document.querySelectorAll("[data-record]").forEach((b) => (b.disabled = Boolean(state.recording)));
+    $("#badges").innerHTML =
+      (state.recording ? `<span class="pill rec">● Nagrywam: ${state.recording.remaining} s</span>` : "") +
+      `<span class="pill">${state.source === "loop" ? "PĘTLA" : "NA ŻYWO"}</span>`;
+    $("#status").textContent = `${state.camera ?? ""} · wirtualna kamera: ${state.virtualCamera ?? "…"}`;
+    $("#clips").innerHTML = state.clips.length
+      ? state.clips.map((clip) => `
+          <div class="clip">
+            <span>${clip.name === state.activeClip ? "▶ " : ""}${clip.name} · ${clip.seconds} s</span>
+            <span class="row">
+              <button data-use="${clip.name}">Użyj</button>
+              <button class="danger" data-delete="${clip.name}">Usuń</button>
+            </span>
+          </div>`).join("")
+      : `<span class="muted">Brak nagrań.</span>`;
+  }
+
+  document.addEventListener("click", (event) => {
+    const b = event.target.closest("button");
+    if (!b) return;
+    if (b.dataset.source) call("/api/source", { source: b.dataset.source });
+    if (b.dataset.glitch) call("/api/glitch", { glitch: b.dataset.glitch });
+    if (b.dataset.record) call("/api/record", { seconds: Number(b.dataset.record) });
+    if (b.dataset.use) call("/api/source", { source: state.source, clip: b.dataset.use });
+    if (b.dataset.delete && confirm(`Usunąć ${b.dataset.delete}?`)) call("/api/delete-clip", { clip: b.dataset.delete });
+  });
+
+  const keys = { l: ["/api/source", { source: "live" }], p: ["/api/source", { source: "loop" }], n: ["/api/glitch", { glitch: "none" }], f: ["/api/glitch", { glitch: "freeze" }], w: ["/api/glitch", { glitch: "weak" }], c: ["/api/glitch", { glitch: "choppy" }] };
+  document.addEventListener("keydown", (event) => {
+    const action = keys[event.key.toLowerCase()];
+    if (action && !event.metaKey && !event.ctrlKey) call(...action);
+  });
+
+  call("/api/state");
+  setInterval(() => call("/api/state"), 1000);
+</script>
+</body>
+</html>
