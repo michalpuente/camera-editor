@@ -6,7 +6,7 @@ import json
 import os
 import re
 import sys
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 # Shown to every app as the camera's name; it goes into a regsvr32 argument on Windows.
@@ -33,6 +33,8 @@ class Config:
     height: int = 720
     fps: int = 30
     clips_dir: str = ""
+    # Clip names played one after another in loop mode; empty = one clip loops on its own.
+    loop_queue: list[str] = field(default_factory=list)
 
     def validate(self) -> Config:
         if not NAME_PATTERN.match(self.camera_name):
@@ -41,6 +43,8 @@ class Config:
             raise ValueError("Rozdzielczość albo liczba klatek poza zakresem")
         if not isinstance(self.lock_input, bool):
             raise ValueError("lock_input musi być true albo false")
+        if not (isinstance(self.loop_queue, list) and all(isinstance(name, str) for name in self.loop_queue)):
+            raise ValueError("loop_queue musi być listą nazw nagrań")
         return self
 
     def clips_path(self, base: Path | None = None) -> Path:

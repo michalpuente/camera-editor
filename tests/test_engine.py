@@ -99,6 +99,33 @@ class EngineTest(unittest.TestCase):
             engine.delete_clip(name)
             self.assertFalse((Path(directory) / f"{name}.mp4").exists())
 
+    def test_plays_queued_clips_in_turn_behind_a_hiccup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = Engine(EngineConfig(width=128, height=72, clips_dir=Path(directory)))
+            for value in (40, 200):
+                name = engine.start_recording(3)
+                start = time.monotonic()
+                for _ in range(3):
+                    engine._frame(start, frame(value))
+                engine._frame(start + 10, frame(value))
+                time.sleep(1.1)  # clip names have one-second resolution
+            first, second = [clip["name"] for clip in engine.state()["clips"]]
+            engine.set_queue([second, first])
+            engine.set_source("loop")
+            engine.cover = None
+            now, seen = 0.0, []
+            for _ in range(30 * 20):
+                now += 1 / 30
+                seen.append(int(engine._frame(now, frame(255)).mean()))
+            # Second clip first, then the first, then the second again; never the live 255.
+            changes = [value for a, value in zip([None] + seen, seen) if a != value]
+            self.assertEqual(changes[:3], [200, 40, 200])
+            self.assertNotIn(255, seen)
+            with self.assertRaises(ValueError):
+                engine.delete_clip(first)  # in the queue that is on air
+            with self.assertRaises(ValueError):
+                engine.set_queue(["nope"])
+
     def test_reloads_saved_clips_at_start(self):
         with tempfile.TemporaryDirectory() as directory:
             first = Engine(EngineConfig(width=128, height=72, clips_dir=Path(directory)))

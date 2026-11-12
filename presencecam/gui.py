@@ -11,6 +11,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QImage, QKeySequence, QPixmap, QShortcut
 from PySide6.QtMultimedia import QCamera, QMediaCaptureSession, QMediaDevices, QVideoFrame, QVideoSink
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QButtonGroup,
     QCheckBox,
@@ -167,6 +168,10 @@ class MainWindow(QMainWindow):
                 virtual_device=device,
             )
         )
+        try:
+            self.engine.set_queue([name for name in self.settings.loop_queue if name in self.engine.clips])
+        except ValueError:
+            pass
         self.engine_thread = threading.Thread(target=self.engine.run, daemon=True)
         self.engine_thread.start()
 
@@ -175,6 +180,16 @@ class MainWindow(QMainWindow):
         self.preview.setMinimumSize(480, 270)
         self.preview.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.preview.setStyleSheet("background: black; border-radius: 6px;")
+        # While others see the loop or a glitch, the real camera stays visible here (to you only),
+        # so you know what you are switching back to.
+        self.live_inset = QLabel(self.preview)
+        self.live_inset.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.live_inset.setStyleSheet("background: black; border: 2px solid #e04040; border-radius: 4px;")
+        self.live_inset.setToolTip("Prawdziwa kamera na żywo: widzisz ją tylko Ty")
+        self.live_inset.hide()
+        self.live_caption = QLabel("NA ŻYWO · tylko Ty", self.preview)
+        self.live_caption.setStyleSheet("background: #e04040; color: white; padding: 1px 6px; border-radius: 3px; font-weight: bold;")
+        self.live_caption.hide()
         self.status = QLabel()
         self.status.setWordWrap(True)
 
@@ -235,16 +250,36 @@ class MainWindow(QMainWindow):
         self.recording_label.setWordWrap(True)
         layout.addWidget(self.recording_label)
         self.clips = QListWidget()
-        self.clips.setMaximumHeight(120)
+        self.clips.setMaximumHeight(100)
         layout.addWidget(self.clips)
         actions = QHBoxLayout()
         use = QPushButton("Użyj w pętli")
         use.clicked.connect(self._use_clip)
         delete = QPushButton("Usuń")
         delete.clicked.connect(self._delete_clip)
+        add = QPushButton("Do kolejki")
+        add.clicked.connect(self._queue_clip)
         actions.addWidget(use)
+        actions.addWidget(add)
         actions.addWidget(delete)
         layout.addLayout(actions)
+
+        queue_hint = QLabel("Kolejka: nagrania lecą po kolei (przeciągnij, żeby zmienić kolejność). Pusta = jedno nagranie w kółko.")
+        queue_hint.setWordWrap(True)
+        layout.addWidget(queue_hint)
+        self.queue_list = QListWidget()
+        self.queue_list.setMaximumHeight(100)
+        self.queue_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.queue_list.model().rowsMoved.connect(lambda *_: self._save_queue(self._queue_names()))
+        layout.addWidget(self.queue_list)
+        queue_actions = QHBoxLayout()
+        remove = QPushButton("Usuń z kolejki")
+        remove.clicked.connect(self._unqueue_clip)
+        clear = QPushButton("Wyczyść kolejkę")
+        clear.clicked.connect(lambda: self._save_queue([]))
+        queue_actions.addWidget(remove)
+        queue_actions.addWidget(clear)
+        layout.addLayout(queue_actions)
         return group
 
     def _settings_group(self) -> QGroupBox:
@@ -291,6 +326,29 @@ class MainWindow(QMainWindow):
         item = self.clips.currentItem()
         if item is not None:
             self._guard(lambda: self.engine.set_source("loop", item.data(Qt.ItemDataRole.UserRole)))
+
+    def _queue_names(self) -> list[str]:
+        return [self.queue_list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.queue_list.count())]
+
+    def _save_queue(self, names: list[str]) -> None:
+        def save() -> None:
+            self.engine.set_queue(names)
+            self.settings.loop_queue = names
+            config_module.save(self.settings)
+
+        self._guard(save)
+
+    def _queue_clip(self) -> None:
+        item = self.clips.currentItem()
+        if item is not None:
+            self._save_queue([*self.engine.queue, item.data(Qt.ItemDataRole.UserRole)])
+
+    def _unqueue_clip(self) -> None:
+        row = self.queue_list.currentRow()
+        if row >= 0:
+            names = list(self.engine.queue)
+            del names[row]
+            self._save_queue(names)
 
     def _delete_clip(self) -> None:
         item = self.clips.currentItem()
@@ -351,15 +409,34 @@ class MainWindow(QMainWindow):
 
     # --- refresh ---
 
+    @staticmethod
+    def _pixmap(frame: np.ndarray, width: int, height: int) -> QPixmap:
+        image = QImage(frame.data, frame.shape[1], frame.shape[0], frame.strides[0], QImage.Format.Format_BGR888)
+        return QPixmap.fromImage(image).scaled(width, height, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+
     def _refresh_preview(self) -> None:
         frame = self.engine.output_frame
-        if frame is None:
+        if frame is not None:
+            self.preview.setPixmap(self._pixmap(frame, self.preview.width(), self.preview.height()))
+        self._refresh_live_inset()
+
+    def _refresh_live_inset(self) -> None:
+        live = self.camera_input.latest
+        state = self.engine.state()
+        if live is None or (state["source"] == "live" and state["glitch"] == "none"):
+            self.live_inset.hide()
+            self.live_caption.hide()
             return
-        height, width = frame.shape[:2]
-        image = QImage(frame.data, width, height, frame.strides[0], QImage.Format.Format_BGR888)
-        self.preview.setPixmap(
-            QPixmap.fromImage(image).scaled(self.preview.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-        )
+        pixmap = self._pixmap(live, max(160, self.preview.width() // 3), max(90, self.preview.height() // 3))
+        margin = 10
+        self.live_inset.setPixmap(pixmap)
+        self.live_inset.resize(pixmap.width() + 4, pixmap.height() + 4)
+        self.live_inset.move(self.preview.width() - self.live_inset.width() - margin, self.preview.height() - self.live_inset.height() - margin)
+        self.live_caption.adjustSize()
+        self.live_caption.move(self.live_inset.x() + 6, self.live_inset.y() + 6)
+        self.live_inset.show()
+        self.live_caption.show()
+        self.live_caption.raise_()
 
     def _refresh_state(self) -> None:
         state = self.engine.state()
@@ -378,6 +455,15 @@ class MainWindow(QMainWindow):
                 self.clips.addItem(text)
                 self.clips.item(self.clips.count() - 1).setData(Qt.ItemDataRole.UserRole, clip["name"])
             self.clips.setCurrentRow(min(selected, self.clips.count() - 1))
+        playing = state["queuePos"] if state["source"] == "loop" else -1
+        queued = [f"{'▶ ' if index == playing else ''}{index + 1}. {name}" for index, name in enumerate(state["queue"])]
+        if queued != [self.queue_list.item(i).text() for i in range(self.queue_list.count())]:
+            selected = self.queue_list.currentRow()
+            self.queue_list.clear()
+            for name, text in zip(state["queue"], queued):
+                self.queue_list.addItem(text)
+                self.queue_list.item(self.queue_list.count() - 1).setData(Qt.ItemDataRole.UserRole, name)
+            self.queue_list.setCurrentRow(min(selected, self.queue_list.count() - 1))
         self.status.setText(f"Wejście: {state.get('camera', '…')} · Wirtualna kamera: {state.get('virtualCamera', '…')}")
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming

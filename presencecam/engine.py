@@ -210,6 +210,9 @@ class Engine:
         self.glitcher = Glitcher()
         self.clips: dict[str, Clip] = {}
         self.active_clip: str | None = None
+        # Clips played one after another in loop mode; empty = the active clip loops on its own.
+        self.queue: list[str] = []
+        self.queue_pos = 0
         self.recording: Recording | None = None
         self.loop_step = 0
         self.cover: SwitchCover | None = None
@@ -230,13 +233,44 @@ class Engine:
             if clip is not None:
                 if clip not in self.clips:
                     raise ValueError(f"nie ma nagrania {clip!r}")
+                if self.queue and clip not in self.queue:
+                    raise ValueError("To nagranie nie jest w kolejce: dodaj je albo wyczyść kolejkę")
+                if self.queue:
+                    self.queue_pos = self.queue.index(clip)
                 self.active_clip = clip
+            elif source == "loop" and self.source != "loop" and self.queue:
+                self.queue_pos = 0
+                self.active_clip = self.queue[0]
             if source == "loop" and self.active_clip is None:
                 raise ValueError("Najpierw nagraj albo wybierz nagranie do pętli")
             if source != self.source or clip is not None:
                 self.cover = SwitchCover(self.last_output, time.monotonic(), self.glitcher.rng)
                 self.loop_step = 0
             self.source = source
+
+    def set_queue(self, names: list[str]) -> None:
+        """Clips to play in turn while looping; a clip may appear more than once."""
+        with self.lock:
+            missing = [name for name in names if name not in self.clips]
+            if missing:
+                raise ValueError(f"nie ma nagrania {missing[0]!r}")
+            playing = self.active_clip if self.source == "loop" else None
+            self.queue = list(names)
+            if playing in self.queue:
+                # Reordering while a clip plays keeps it playing; the queue continues after it.
+                self.queue_pos = self.queue.index(playing)
+            elif self.queue:
+                self.queue_pos = 0
+                if self.source == "loop":
+                    self._switch_clip(self.queue[0])
+                else:
+                    self.active_clip = self.queue[0]
+
+    def _switch_clip(self, name: str, now: float | None = None) -> None:
+        """Changes the looped clip behind a connection hiccup, like a live/loop switch."""
+        self.active_clip = name
+        self.cover = SwitchCover(self.last_output, time.monotonic() if now is None else now, self.glitcher.rng)
+        self.loop_step = 0
 
     def set_glitch(self, glitch: str) -> None:
         with self.lock:
@@ -261,11 +295,13 @@ class Engine:
         with self.lock:
             if name not in self.clips:
                 raise ValueError(f"nie ma nagrania {name!r}")
-            if self.source == "loop" and self.active_clip == name:
+            if self.source == "loop" and (self.active_clip == name or name in self.queue):
                 raise ValueError("Najpierw wróć na żywo, to nagranie jest teraz w pętli")
             del self.clips[name]
+            self.queue = [item for item in self.queue if item != name]
+            self.queue_pos = min(self.queue_pos, max(0, len(self.queue) - 1))
             if self.active_clip == name:
-                self.active_clip = None
+                self.active_clip = self.queue[0] if self.queue else None
             (self.config.clips_dir / f"{name}.mp4").unlink(missing_ok=True)
 
     def state(self) -> dict:
@@ -277,6 +313,8 @@ class Engine:
                 "source": self.source,
                 "glitch": self.glitch,
                 "activeClip": self.active_clip,
+                "queue": list(self.queue),
+                "queuePos": self.queue_pos,
                 "clips": [{"name": clip.name, "seconds": round(len(clip.frames) / self.config.fps, 1)} for clip in self.clips.values()],
                 "recording": recording,
                 **self.status,
@@ -334,7 +372,8 @@ class Engine:
                     self.recording.writer.release()
                     clip = self.recording.clip
                     self.clips[clip.name] = clip
-                    self.active_clip = clip.name
+                    if self.source != "loop":  # never cut away from a clip that is on air
+                        self.active_clip = clip.name
                     self.recording = None
 
             if self.cover is not None and self.cover.done(now):
@@ -348,6 +387,11 @@ class Engine:
                 encoded = frames[pingpong_index(self.loop_step, len(frames))]
                 frame = cv2.imdecode(np.frombuffer(encoded, np.uint8), cv2.IMREAD_COLOR)
                 self.loop_step += 1
+                # In a queue each clip plays forward and back once, then the next one takes over.
+                if len(self.queue) > 1 and self.loop_step >= max(1, 2 * len(frames) - 2):
+                    self.queue_pos = (self.queue_pos + 1) % len(self.queue)
+                    self.last_output = frame
+                    self._switch_clip(self.queue[self.queue_pos], now)
 
             if self.cover is not None:
                 frame = self.cover.apply(frame, now)
